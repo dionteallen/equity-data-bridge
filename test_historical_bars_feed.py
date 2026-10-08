@@ -158,7 +158,13 @@ class GetHistoricalBarsToolTests(unittest.TestCase):
         tools = {tool.name: tool for tool in bridge.mcp._tool_manager.list_tools()}
         self.assertEqual(
             sorted(tools),
-            ["get_fama_french_5factors", "get_historical_bars", "get_latest_quote"],
+            [
+                "get_fama_french_5factors",
+                "get_historical_bars",
+                "get_latest_quote",
+                "get_opening_auctions",
+                "get_trades",
+            ],
         )
         bars = tools["get_historical_bars"]
         feed = bars.parameters["properties"]["feed"]
