@@ -424,7 +424,8 @@ def get_opening_auctions(
             description=(
                 "Only 'sip' is valid for Alpaca auctions. Omit it, or leave it "
                 "blank, for sip. Any other value is an error and does not call Alpaca. "
-                "The same 15-minute Basic-plan SIP clamp as get_historical_bars applies."
+                "Alpaca's Basic plan rejects SIP from the most recent 15 minutes; "
+                "this uses the same clamp as get_historical_bars."
             )
         ),
     ] = "sip",
@@ -459,12 +460,13 @@ def get_opening_auctions(
     A print is {t, x, p, s, c}: t timestamp, x exchange code, p price,
     s size, and c the condition. Condition "Q" is the Market Center
     Official Open. Condition "O" is the Market Center Opening Trade. The
-    same name can print on more than one exchange at different prices, so
+    same symbol can print on more than one exchange at different prices, so
     the caller picks the listing exchange's official open (condition Q)
     print. This tool does not choose an exchange. That Q price is the
     exchange's official open and can differ from the open of a SIP bar.
 
-    Pages follow next_page_token, up to 50 pages of 10,000 rows. Hitting
+    Pages follow next_page_token, up to 50 pages of 10,000 data points
+    (a point is one symbol's day, not one print). Hitting
     that cap returns status "partial" and the rows already retrieved;
     status "ok" means the window was fully read. Any non-200 Alpaca
     response is returned as status "error" with http_status and the
@@ -538,8 +540,8 @@ def get_trades(
             description=(
                 "Price feed: 'sip' (default, consolidated tape) or 'iex' "
                 "(Investors Exchange only). Case-insensitive. Any other value "
-                "is an error and does not call Alpaca. sip uses the same "
-                "15-minute Basic-plan clamp as get_historical_bars."
+                "is an error and does not call Alpaca. sip uses the same clamp "
+                "as get_historical_bars for the most recent 15 minutes."
             )
         ),
     ] = "sip",
