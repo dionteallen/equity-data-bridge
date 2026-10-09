@@ -192,6 +192,19 @@ def get_historical_bars(
     date of "today" is moved back too. If the whole requested window is
     inside those 15 minutes, the call returns an error instead of asking
     Alpaca. Older sip windows are forwarded unchanged.
+
+    Alpaca pages long windows with next_page_token. A 15Min range such as
+    2026-07-01 through 2026-10-07 does not fit in one page. This follows
+    that token until it is gone, up to 50 pages of 10,000 bars, the same
+    cap get_opening_auctions and get_trades use. status "ok" means every
+    page was read. The response includes pages and bar_count.
+
+    Hitting the page cap, stopping while a next_page_token remains, or
+    stopping because the size limit (that cap times the page size) is
+    reached returns status "error" and truncated true. The partial bars
+    are left out of that response. Narrow the window and request it
+    again. An empty window, including a body whose bars value is null,
+    returns status "ok", bar_count 0, and bars [].
     """
     feed_name, end_sent, end_adjusted, error = _prepare_historical_bars_request(feed, start, end)
     if error is not None:
@@ -202,15 +215,31 @@ def get_historical_bars(
         "timeframe": timeframe,
         "start": start,
         "end": end_sent,
-        "limit": 10000,
+        "limit": ALPACA_PAGE_LIMIT,
         "adjustment": "raw",
         "feed": feed_name,
     }
-    with httpx.Client(timeout=30) as client:
-        resp = client.get(url, headers=ALPACA_HEADERS, params=params)
-    if resp.status_code != 200:
-        return {"status": "error", "http_status": resp.status_code, "detail": resp.text}
-    data = resp.json()
+    bars, pages, error = _get_bars_pages(url, params)
+    if error is not None:
+        if not error.get("truncated"):
+            return error
+        result = {
+            "status": "error",
+            "truncated": True,
+            "detail": error["detail"],
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "feed": feed_name,
+            "pages": pages,
+            "bar_count": error["bar_count"],
+        }
+        if end_adjusted:
+            result["end_requested"] = end
+            result["end_effective"] = end_sent
+            result["note"] = _SIP_CLAMP_NOTE
+        result["fetched_at"] = datetime.now(timezone.utc).isoformat()
+        return result
+
     result = {
         "status": "ok",
         "symbol": symbol,
@@ -220,12 +249,10 @@ def get_historical_bars(
     if end_adjusted:
         result["end_requested"] = end
         result["end_effective"] = end_sent
-        result["note"] = (
-            "end was moved earlier so this SIP query stays outside the most "
-            "recent 15 minutes. Alpaca's Basic plan rejects newer SIP history."
-        )
-    result["bar_count"] = len(data.get("bars", []))
-    result["bars"] = data.get("bars", [])
+        result["note"] = _SIP_CLAMP_NOTE
+    result["pages"] = pages
+    result["bar_count"] = len(bars)
+    result["bars"] = bars
     result["fetched_at"] = datetime.now(timezone.utc).isoformat()
     return result
 
@@ -241,8 +268,11 @@ def get_latest_quote(symbol: str) -> dict:
     return {"status": "ok", "symbol": symbol, **resp.json()}
 
 
-# Alpaca pages historical auctions and trades with next_page_token. limit
-# applies to the whole page, not per symbol, and 10000 is the documented max.
+# Alpaca pages historical bars, auctions, and trades with next_page_token.
+# 10000 is the documented maximum page size. Auctions and trades apply that
+# limit to the whole page, not per symbol. Bars uses the same page cap.
+# max_pages * page size is the bars size limit; crossing either bound while
+# a next_page_token remains is a truncation error, not a short ok series.
 ALPACA_PAGE_LIMIT = 10000
 ALPACA_MAX_PAGES = 50
 _SIP_CLAMP_NOTE = (
@@ -254,6 +284,94 @@ _SIP_CLAMP_NOTE = (
 def _alpaca_http_error(resp) -> dict:
     """Return a non-200 Alpaca response without rewriting its body."""
     return {"status": "error", "http_status": resp.status_code, "detail": resp.text}
+
+
+def _bars_truncation_error(
+    pages: int,
+    bar_count: int,
+    page_limit: int,
+    size_limit: int,
+    hit_page_cap: bool,
+    hit_size_limit: bool,
+) -> dict:
+    """A bars read stopped while next_page_token was still set.
+
+    The partial bars stay out of this payload. Callers that only inspect
+    a bars array must not be able to treat the stop as a complete series.
+    """
+    reasons = []
+    if hit_page_cap:
+        reasons.append(f"stopped after {pages} pages of {page_limit}")
+    if hit_size_limit:
+        reasons.append(
+            f"size limit of {size_limit} bars forced the stop ({bar_count} bars read)"
+        )
+    if not reasons:
+        reasons.append(f"stopped after {pages} pages")
+    detail = (
+        "; ".join(reasons)
+        + "; next_page_token was still set, so the series is truncated and was not returned"
+        + "; narrow the window"
+    )
+    return {
+        "status": "error",
+        "truncated": True,
+        "detail": detail,
+        "pages": pages,
+        "bar_count": bar_count,
+    }
+
+
+def _get_bars_pages(url: str, params: dict, max_pages: Optional[int] = None):
+    """GET single-symbol bars, following next_page_token.
+
+    Returns (bars, pages, error). bars is a list when the token is
+    exhausted, including an empty list when Alpaca sends bars: null.
+    On a non-200 response, a body that is not the documented object, or
+    a stop while next_page_token remains, bars is None and error is set.
+    A remaining token is truncated: true. Earlier pages are not returned
+    with that error, so a partial series cannot look complete.
+    """
+    if max_pages is None:
+        max_pages = ALPACA_MAX_PAGES
+    page_limit = ALPACA_PAGE_LIMIT
+    size_limit = max_pages * page_limit
+    collected: list = []
+    pages = 0
+    token = None
+    with httpx.Client(timeout=30) as client:
+        while True:
+            query = dict(params)
+            if token:
+                query["page_token"] = token
+            resp = client.get(url, headers=ALPACA_HEADERS, params=query)
+            pages += 1
+            if resp.status_code != 200:
+                return None, pages, _alpaca_http_error(resp)
+            try:
+                data = resp.json()
+            except ValueError:
+                return None, pages, _alpaca_http_error(resp)
+            if not isinstance(data, dict):
+                return None, pages, _alpaca_http_error(resp)
+            page_bars = data.get("bars") or []
+            if not isinstance(page_bars, list):
+                return None, pages, _alpaca_http_error(resp)
+            collected.extend(page_bars)
+            token = data.get("next_page_token")
+            if not token:
+                return collected, pages, None
+            hit_page_cap = pages >= max_pages
+            hit_size_limit = len(collected) >= size_limit
+            if hit_page_cap or hit_size_limit:
+                return None, pages, _bars_truncation_error(
+                    pages,
+                    len(collected),
+                    page_limit,
+                    size_limit,
+                    hit_page_cap,
+                    hit_size_limit,
+                )
 
 
 def _get_paginated(url: str, params: dict, payload_key: str, max_pages: Optional[int] = None):

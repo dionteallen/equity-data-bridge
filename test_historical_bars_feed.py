@@ -1,4 +1,4 @@
-"""Stdlib checks for historical-bar feed selection. No network, no extra packages."""
+"""Stdlib checks for historical-bar feed selection and pagination. No network, no extra packages."""
 
 import os
 import unittest
@@ -194,6 +194,9 @@ class GetHistoricalBarsToolTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["feed"], "iex")
         self.assertNotIn("end_effective", result)
+        self.assertNotIn("truncated", result)
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["bar_count"], 1)
         self.assertEqual(result["bars"][0]["o"], 17.33)
 
     @patch("equity_data_bridge_server.httpx.Client")
@@ -216,6 +219,9 @@ class GetHistoricalBarsToolTests(unittest.TestCase):
         self.assertEqual(result["end_requested"], "2026-10-08T21:40:00Z")
         self.assertEqual(result["end_effective"], CUTOFF)
         self.assertIn("15 minutes", result["note"])
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["bar_count"], 1)
+        self.assertNotIn("truncated", result)
 
     @patch("equity_data_bridge_server.httpx.Client")
     def test_invalid_feed_does_not_call_alpaca(self, client_cls):
@@ -237,6 +243,156 @@ class GetHistoricalBarsToolTests(unittest.TestCase):
         client_cls.assert_not_called()
         self.assertEqual(result["status"], "error")
         self.assertIn(CUTOFF, result["detail"])
+
+
+def _bar(when, price=1.0):
+    return {"t": when, "o": price, "h": price, "l": price, "c": price, "v": 1}
+
+
+def _json_response(payload, status=200, text=""):
+    response = MagicMock()
+    response.status_code = status
+    response.json.return_value = payload
+    response.text = text
+    return response
+
+
+def _client_returning(responses):
+    client = MagicMock()
+    client.get.side_effect = responses
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    manager.__exit__.return_value = False
+    return manager, client
+
+
+class HistoricalBarsPaginationTests(unittest.TestCase):
+    """Long windows must follow next_page_token. A short first page is not ok."""
+
+    @patch("equity_data_bridge_server.httpx.Client")
+    def test_three_month_15min_window_fetches_every_page(self, client_cls):
+        # A 15Min query for 2026-07-01..2026-10-07. The first Alpaca page
+        # ends 2026-07-22 and carries next_page_token; the window itself
+        # runs through 2026-10-07. Ignoring the token returns that July
+        # page with status ok. Following it reaches the window end.
+        page_one = [
+            _bar("2026-07-01T13:30:00Z", 10.0),
+            _bar("2026-07-22T19:45:00Z", 11.0),
+        ]
+        page_two = [
+            _bar("2026-08-18T13:30:00Z", 12.0),
+            _bar("2026-09-15T19:45:00Z", 13.0),
+        ]
+        page_three = [
+            _bar("2026-10-01T13:30:00Z", 14.0),
+            _bar("2026-10-07T19:45:00Z", 15.0),
+        ]
+        manager, client = _client_returning([
+            _json_response({"bars": page_one, "next_page_token": "july-page"}),
+            _json_response({"bars": page_two, "next_page_token": "sept-page"}),
+            _json_response({"bars": page_three, "next_page_token": None}),
+        ])
+        client_cls.return_value = manager
+
+        result = bridge.get_historical_bars("PCG", "15Min", "2026-07-01", "2026-10-07")
+
+        self.assertEqual(client.get.call_count, 3)
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("truncated", result)
+        self.assertEqual(result["pages"], 3)
+        self.assertEqual(result["bar_count"], 6)
+        self.assertEqual(result["bars"], page_one + page_two + page_three)
+        self.assertEqual(result["bars"][-1]["t"], "2026-10-07T19:45:00Z")
+        self.assertGreaterEqual(result["bars"][-1]["t"], "2026-10-07")
+        self.assertEqual(client.get.call_args_list[0].args[0], "https://data.alpaca.markets/v2/stocks/PCG/bars")
+        tokens = []
+        for call in client.get.call_args_list:
+            self.assertEqual(call.kwargs["headers"], bridge.ALPACA_HEADERS)
+            params = call.kwargs["params"]
+            self.assertEqual(params["timeframe"], "15Min")
+            self.assertEqual(params["start"], "2026-07-01")
+            self.assertEqual(params["end"], "2026-10-07")
+            self.assertEqual(params["limit"], 10000)
+            self.assertEqual(params["adjustment"], "raw")
+            self.assertEqual(params["feed"], "iex")
+            tokens.append(params.get("page_token"))
+        self.assertEqual(tokens, [None, "july-page", "sept-page"])
+        self.assertNotIn("page_token", client.get.call_args_list[0].kwargs["params"])
+
+    @patch("equity_data_bridge_server.httpx.Client")
+    def test_page_cap_is_a_loud_truncation(self, client_cls):
+        pages = [
+            _json_response({
+                "bars": [_bar(f"2026-07-{day:02d}T13:30:00Z", float(day))],
+                "next_page_token": f"tok-{day}",
+            })
+            for day in (1, 2, 3)
+        ]
+        manager, client = _client_returning(pages)
+        client_cls.return_value = manager
+
+        with patch("equity_data_bridge_server.ALPACA_MAX_PAGES", 2):
+            result = bridge.get_historical_bars("PCG", "15Min", "2026-07-01", "2026-10-07")
+
+        self.assertEqual(client.get.call_count, 2)
+        self.assertEqual(result["status"], "error")
+        self.assertNotEqual(result["status"], "ok")
+        self.assertIs(result["truncated"], True)
+        self.assertNotIn("bars", result)
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["bar_count"], 2)
+        self.assertIn("stopped after 2 pages of 10000", result["detail"])
+        self.assertIn("next_page_token", result["detail"])
+        self.assertIn("narrow the window", result["detail"])
+        self.assertIn("truncated", result["detail"])
+
+    @patch("equity_data_bridge_server.httpx.Client")
+    def test_size_limit_with_a_remaining_token_is_a_loud_truncation(self, client_cls):
+        # Page cap is still far away. The accumulated bars hit the size
+        # budget (max pages times page size) while next_page_token remains.
+        oversized = [_bar(f"2026-07-01T13:{minute:02d}:00Z", float(minute)) for minute in range(20)]
+        manager, client = _client_returning([
+            _json_response({"bars": oversized, "next_page_token": "still-more"}),
+            _json_response({"bars": [_bar("2026-10-07T19:45:00Z")], "next_page_token": None}),
+        ])
+        client_cls.return_value = manager
+
+        with patch("equity_data_bridge_server.ALPACA_MAX_PAGES", 10), patch(
+            "equity_data_bridge_server.ALPACA_PAGE_LIMIT", 2
+        ):
+            result = bridge.get_historical_bars("PCG", "15Min", "2026-07-01", "2026-10-07")
+
+        self.assertEqual(client.get.call_count, 1)
+        self.assertEqual(result["status"], "error")
+        self.assertIs(result["truncated"], True)
+        self.assertNotIn("bars", result)
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["bar_count"], 20)
+        self.assertIn("size limit of 20 bars forced the stop", result["detail"])
+        self.assertIn("next_page_token was still set", result["detail"])
+        self.assertNotIn("pages of", result["detail"])
+
+    @patch("equity_data_bridge_server.httpx.Client")
+    def test_null_bars_is_an_empty_ok_window(self, client_cls):
+        # Alpaca sends bars: null for an empty window. len(None) used to
+        # raise TypeError: object of type 'NoneType' has no len().
+        for payload in (
+            {"bars": None, "symbol": "PCG", "next_page_token": None},
+            {"symbol": "PCG", "next_page_token": None},
+        ):
+            with self.subTest(payload=payload):
+                manager, client = _client_returning([_json_response(payload)])
+                client_cls.return_value = manager
+                result = bridge.get_historical_bars("PCG", "15Min", "2026-07-04", "2026-07-04")
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["symbol"], "PCG")
+                self.assertEqual(result["timeframe"], "15Min")
+                self.assertEqual(result["feed"], "iex")
+                self.assertEqual(result["pages"], 1)
+                self.assertEqual(result["bar_count"], 0)
+                self.assertEqual(result["bars"], [])
+                self.assertNotIn("truncated", result)
+                self.assertEqual(client.get.call_count, 1)
 
 
 if __name__ == "__main__":
