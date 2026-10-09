@@ -23,6 +23,11 @@ ALPACA_API_SECRET_KEY = os.environ["ALPACA_API_SECRET_KEY"]
 PORT = int(os.environ.get("PORT", "10000"))
 
 ALPACA_DATA_BASE = "https://data.alpaca.markets/v2"
+# Trading API base for read-only reference data (assets). Market-data tools keep using ALPACA_DATA_BASE.
+# Alpaca keys are environment-specific: paper keys work only on paper-api, live keys only on api.
+# Owner sets this to match the key pair already in ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY.
+# Default is the paper trading API. A live key needs https://api.alpaca.markets/v2.
+ALPACA_TRADING_BASE = os.environ.get("ALPACA_TRADING_BASE", "https://paper-api.alpaca.markets/v2")
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY_ID,
     "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY,
@@ -750,6 +755,111 @@ def get_trades(
         "trades": rows,
     }
     return _finish_historical_result(result, end, end_sent, end_adjusted, error)
+
+
+_ASSET_STATUS = {"active", "inactive"}
+_ASSET_EXCHANGES = {"AMEX", "ARCA", "BATS", "NYSE", "NASDAQ", "NYSEARCA", "OTC"}
+
+
+@mcp.tool()
+def list_assets(
+    status: str = "active",
+    asset_class: str = "us_equity",
+    exchange: Optional[str] = None,
+) -> dict:
+    """
+    Alpaca reference list of assets, GET {ALPACA_TRADING_BASE}/assets. Read-only.
+    Passed through as Alpaca sent them: never invented, never filtered beyond
+    the query parameters below. No order, account, or position endpoint is called.
+
+    status: "active" (default) or "inactive". Matching is case-insensitive.
+    Anything else is an error and does not call Alpaca. Inactive is accepted
+    by this tool but is not to be used yet.
+    asset_class: "us_equity" (default).
+    exchange: optional, one of AMEX, ARCA, BATS, NYSE, NASDAQ, NYSEARCA, OTC.
+    Any other exchange is an error and does not call Alpaca.
+
+    Each asset is the object Alpaca returned, unchanged. Alpaca's fields include
+    id, class, exchange, symbol, name, status, tradable, marginable, shortable,
+    easy_to_borrow, fractionable, maintenance_margin_requirement, attributes.
+
+    Only a non-empty list is status "ok", with params, asset_count, and
+    fetched_at. A non-200 response (including 401 and 403) is status "error"
+    with http_status and the response body. Invalid JSON, a null body, a
+    non-list body, or an empty list is also status "error" and does not
+    include an assets list. An empty list is an error because an active
+    us_equity list cannot legitimately be empty.
+
+    CAVEATS (state them in every consumer): this is a CURRENT snapshot. It has no
+    listing date, no delisting date and no ticker history. A reused ticker shows
+    only the current holder. Coverage of names delisted before Alpaca started
+    tracking them is undocumented.
+    """
+    if not isinstance(status, str):
+        return {"status": "error", "detail": "status must be 'active' or 'inactive'"}
+    status = status.strip().lower()
+    if status not in _ASSET_STATUS:
+        return {"status": "error", "detail": "status must be 'active' or 'inactive'"}
+    params = {"status": status, "asset_class": asset_class}
+    if exchange:
+        if not isinstance(exchange, str):
+            return {
+                "status": "error",
+                "detail": f"exchange must be one of {sorted(_ASSET_EXCHANGES)}",
+            }
+        ex = exchange.strip().upper()
+        if ex not in _ASSET_EXCHANGES:
+            return {
+                "status": "error",
+                "detail": f"exchange must be one of {sorted(_ASSET_EXCHANGES)}",
+            }
+        params["exchange"] = ex
+    with httpx.Client(timeout=60) as client:
+        resp = client.get(
+            f"{ALPACA_TRADING_BASE}/assets",
+            headers=ALPACA_HEADERS,
+            params=params,
+        )
+    if resp.status_code != 200:
+        return _alpaca_http_error(resp)
+    try:
+        assets = resp.json()
+    except ValueError:
+        text = resp.text if isinstance(resp.text, str) else ""
+        return {
+            "status": "error",
+            "http_status": resp.status_code,
+            "detail": f"response body is not valid JSON: {text}",
+        }
+    if assets is None:
+        return {
+            "status": "error",
+            "http_status": resp.status_code,
+            "detail": "Alpaca returned a null asset list; a non-empty list of assets is required",
+        }
+    if not isinstance(assets, list):
+        return {
+            "status": "error",
+            "http_status": resp.status_code,
+            "detail": "Alpaca asset response was not a list; a non-empty list of assets is required",
+        }
+    if len(assets) == 0:
+        return {
+            "status": "error",
+            "http_status": resp.status_code,
+            "detail": (
+                "Alpaca returned an empty asset list "
+                f"for params {params}; an active us_equity list cannot legitimately be empty"
+            ),
+        }
+    return {
+        "status": "ok",
+        "base": ALPACA_TRADING_BASE,
+        "params": params,
+        "asset_count": len(assets),
+        "assets": assets,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 FAMA_FRENCH_5_DAILY_URL = (

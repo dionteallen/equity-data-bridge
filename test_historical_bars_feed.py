@@ -164,6 +164,7 @@ class GetHistoricalBarsToolTests(unittest.TestCase):
                 "get_latest_quote",
                 "get_opening_auctions",
                 "get_trades",
+                "list_assets",
             ],
         )
         bars = tools["get_historical_bars"]
