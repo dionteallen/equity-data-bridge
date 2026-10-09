@@ -80,6 +80,7 @@ class ToolContractTests(unittest.TestCase):
                 "get_latest_quote",
                 "get_opening_auctions",
                 "get_trades",
+                "list_assets",
             ],
         )
         self.assertEqual(
